@@ -1246,6 +1246,16 @@ body.dragging .currency-row:hover { background: var(--panel); box-shadow: none; 
 .toast { position: fixed; top: 76px; left: 50%; transform: translateX(-50%); background: var(--panel); border: 1px solid var(--border); padding: 9px 16px; border-radius: 8px; box-shadow: var(--shadow); font-size: 12.5px; z-index: 300; opacity: 0; pointer-events: none; transition: opacity var(--transition); }
 .toast.show { opacity: 1; }
 .empty-hint { font-size: 13px; color: var(--text-dim); text-align: center; padding: 18px; }
+.rate-loading { position: relative; color: transparent !important; -webkit-text-fill-color: transparent !important; }
+.rate-loading::after {
+  content: ""; position: absolute; inset: 15% 0;
+  border-radius: 8px;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 24%, var(--panel-2)), transparent);
+  background-size: 200% 100%; animation: rateShimmer 1.1s ease-in-out infinite;
+}
+@keyframes rateShimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+.rate-unavailable { color: var(--warn); font-weight: 700; }
+
 
 @media (max-width: 700px) {
   .app-header { padding: 10px 14px; gap: 8px; }
@@ -1709,40 +1719,11 @@ const flagHTML = (c, w = 40) => c && c.iso
   ? `<img src="https://flagcdn.com/w${w}/${c.iso}.png" srcset="https://flagcdn.com/w${w*2}/${c.iso}.png 2x" alt="${c.country}" loading="lazy" />`
   : "";
 
-/* ---------- Fallback rates (units per 1 USD, used if API is unreachable) ---------- */
-// Updated 2026 baseline. Used ONLY when all live APIs are unreachable.
-// USD/CNY ≈ 6.84, USD/EUR ≈ 0.93 etc. — the live APIs always override these.
-const FALLBACK_USD = {
-  USD:1, EUR:0.93, JPY:148, GBP:0.78, CHF:0.86, AUD:1.50, CAD:1.34, CNY:6.84,
-  HKD:7.78, NZD:1.64, SGD:1.32, SEK:10.3, NOK:10.5, DKK:6.92, KRW:1320,
-  INR:84.0, BRL:5.10, MXN:17.5, RUB:88, ZAR:18.4, TRY:36, TWD:31.8,
-  // Europe
-  PLN:3.95, CZK:22.5, HUF:355, RON:4.62, BGN:1.82, ISK:135, ILS:3.65, UAH:41,
-  BYN:3.30, MDL:17.4, AMD:390, AZN:1.70, GEL:2.70, RSD:109, BAM:1.82,
-  MKD:57, ALL:92,
-  // Middle East
-  AED:3.67, SAR:3.75, QAR:3.64, KWD:0.31, BHD:0.38, OMR:0.38, JOD:0.71,
-  LBP:89500, SYP:13000, YER:250, IQD:1310, IRR:42000,
-  // Asia
-  IDR:15600, MYR:4.50, THB:34, PHP:57, VND:25000, BDT:115, PKR:278, NPR:135,
-  LKR:295, BTN:84.0, BND:1.32, KHR:4080, LAK:21800, MOP:8.01, MMK:2100,
-  MNT:3500, MVR:15.4, AFN:72, KPW:900, KZT:480, UZS:12800, TJS:10.8,
-  TMT:3.5, KGS:88,
-  // Africa
-  EGP:49, NGN:1500, KES:130, GHS:15.5, MAD:9.95, DZD:134, TND:3.10, LYD:4.85,
-  SDG:600, SSP:1300, ETB:120, ERN:15, DJF:178, SOS:570, UGX:3700, TZS:2700,
-  RWF:1370, BIF:2950, CDF:2850, AOA:920, ZMW:27, ZWL:25, MWK:1740,
-  MZN:64, NAD:18.4, BWP:13.7, LSL:18.4, SZL:18.4, MGA:4600, MUR:46,
-  SCR:13.7, KMF:457, MRU:39.8, GMD:71, GNF:8650, SLE:22.7, LRD:198,
-  CVE:103, STN:22.8, XAF:610, XOF:610,
-  // Americas
-  ARS:1050, CLP:960, COP:4250, PEN:3.78, BOB:6.91, PYG:7800, UYU:40, VES:50,
-  GYD:210, SRD:35, CRC:510, GTQ:7.75, HNL:25, NIO:36.8, PAB:1, DOP:61,
-  HTG:131, JMD:158, TTD:6.78, BBD:2, BSD:1, BMD:1, BZD:2, KYD:0.83, CUP:24,
-  XCD:2.7,
-  // Oceania
-  FJD:2.26, PGK:3.95, SBD:8.5, TOP:2.40, VUV:121, WST:2.75, XPF:111
-};
+/* ---------- No static exchange-rate fallback ----------
+   Live conversion values come only from the frontend fetch() providers below.
+   This empty object is retained only so legacy non-conversion helpers remain
+   harmless if referenced; it is never merged into displayed live rates. */
+const FALLBACK_USD = {};
 
 /* ---------- SINGLE SOURCE OF TRUTH (state) ---------- */
 const state = {
@@ -1760,8 +1741,11 @@ const state = {
   // Trust signals — explicit freshness for users
   lastUpdate: null,         // ISO date string of API rate publication
   fetchedAt: null,          // wall-clock fetch time (Date)
-  dataSource: "Frankfurter (ECB)",  // human-readable source label
-  isLive: true              // false when in offline-fallback mode
+  dataSource: "ExchangeRate-API Open Access",  // human-readable source label
+  isLive: true,             // false when live API data is unavailable
+  isFetchingRates: false,
+  rateError: null,
+  sourceBase: "USD"
 };
 
 /* ---------- i18n — comprehensive coverage across every visible string ---------- */
@@ -2581,65 +2565,94 @@ function refreshLangTrigger() {
 const FRANK = "https://api.frankfurter.app";
 const FRANK_OK = new Set(["AUD","BGN","BRL","CAD","CHF","CNY","CZK","DKK","EUR","GBP","HKD","HUF","IDR","ILS","INR","ISK","JPY","KRW","MXN","MYR","NOK","NZD","PHP","PLN","RON","SEK","SGD","THB","TRY","USD","ZAR"]);
 
-/* ---------- Hybrid rate fetch — curated truth + live validation ----------
-   PROBLEM: Some live FX APIs return mismatched data (different from real
-   market rates) because their dataset is stale, regional (offshore vs.
-   onshore CNH/CNY), or reflects ECB reference rates that diverge from spot.
-   STRATEGY: Treat the curated FALLBACK_USD table as the source of truth
-   for major currencies. Live API rates are only adopted when they agree
-   with the curated value within ±3% (i.e. the live API is corroborating,
-   not contradicting). Currencies NOT in FALLBACK get the live value as-is.
-   This makes USD/CNY etc. display the user-verified rate consistently. */
-async function fetchUSDRates(date = null) {
-  const today = new Date().toISOString().slice(0,10);
-  const isHistorical = !!date && date !== today;
+/* ---------- Live exchange-rate fetch ----------
+   Primary source: ExchangeRate-API Open Access (no API key required).
+   Fallback source: Frankfurter (free/open source, no API key required).
+   Both calls are made from the frontend with fetch(). No stale or hardcoded
+   exchange table is rendered if live rates cannot be fetched. */
+const LIVE_API_PRIMARY = "https://open.er-api.com/v6/latest";
+const LIVE_API_FALLBACK = "https://api.frankfurter.dev/v2/rates";
 
-  // For an explicit historical date, always use date-seeded synth so each
-  // date shows distinct values that aren't anchored to today's rates.
-  if (isHistorical) {
-    state.dataSource = "Curated historical (estimated)";
-    return { rates: synthesizeRatesForDate(date), date, fallback: true };
+function normalizeRatesFromBase(base, providerRates) {
+  const clean = {};
+  Object.entries(providerRates || {}).forEach(([code, value]) => {
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) clean[code.toUpperCase()] = n;
+  });
+  clean[base] = 1;
+
+  // The rest of the app stores rates as units per 1 USD. If the API was
+  // requested with a non-USD base, normalize the live response back to USD so
+  // all existing cross-rate calculations remain correct.
+  if (base === "USD") return clean;
+  const usdPerBase = clean.USD;
+  if (!usdPerBase || !Number.isFinite(usdPerBase) || usdPerBase <= 0) {
+    throw new Error("Live response does not include USD, so rates cannot be normalized.");
   }
+  const normalized = { USD: 1 };
+  Object.entries(clean).forEach(([code, value]) => {
+    normalized[code] = value / usdPerBase;
+  });
+  return normalized;
+}
 
-  // Try to grab a live snapshot for VALIDATION purposes
-  let liveSnapshot = null;
+function ratesObjectFromFrankfurterRows(rows) {
+  const out = {};
+  let freshestDate = null;
+  (rows || []).forEach(row => {
+    if (row && row.quote && Number.isFinite(Number(row.rate))) {
+      out[String(row.quote).toUpperCase()] = Number(row.rate);
+      if (row.date && (!freshestDate || row.date > freshestDate)) freshestDate = row.date;
+    }
+  });
+  return { rates: out, date: freshestDate };
+}
+
+function extractLastUpdate(payload) {
+  if (!payload) return new Date().toISOString().slice(0, 10);
+  const unix = payload.time_last_update_unix ?? payload.time_last_updated_unix;
+  if (unix) return new Date(unix * 1000).toISOString().slice(0, 10);
+  return payload.date || new Date().toISOString().slice(0, 10);
+}
+
+async function fetchLiveRates(base = "USD") {
+  const code = (base || "USD").toUpperCase();
+
+  // Primary: ExchangeRate-API Open Access. Dynamic base is encoded directly
+  // in the URL so selecting a new base triggers a new base-specific request.
   try {
-    const r = await fetch("https://open.er-api.com/v6/latest/USD", { cache: "no-store" });
-    if (r.ok) {
-      const j = await r.json();
-      if (j && j.rates && Object.keys(j.rates).length > 10) liveSnapshot = j.rates;
-    }
-  } catch (e) { /* live API unreachable — that's fine */ }
-
-  // Build result: curated rates win for any pair where live disagrees by >3%
-  const rates = { USD: 1 };
-  let liveAdoptions = 0;
-  let curatedOverrides = 0;
-  for (const k in FALLBACK_USD) {
-    if (k === "USD") continue;
-    const curated = FALLBACK_USD[k];
-    const live = liveSnapshot ? liveSnapshot[k] : null;
-    // Tight validation: only accept live rate when it agrees with the curated
-    // value to within 1%. This prevents live-API drift from leaking into majors.
-    if (live && isFinite(live) && Math.abs(live - curated) / curated < 0.01) {
-      rates[k] = live;             // Live API close enough — use the fresher value
-      liveAdoptions++;
-    } else {
-      rates[k] = curated;          // Live missing or way off — trust curated
-      if (live) curatedOverrides++;
-    }
-  }
-  // Extra currencies returned by the live API but not in our curated set
-  if (liveSnapshot) {
-    for (const k in liveSnapshot) {
-      if (!(k in rates) && isFinite(liveSnapshot[k])) rates[k] = liveSnapshot[k];
-    }
+    const r = await fetch(`${LIVE_API_PRIMARY}/${encodeURIComponent(code)}`, { cache: "no-store" });
+    if (!r.ok) throw new Error(`Primary API HTTP ${r.status}`);
+    const j = await r.json();
+    if (j.result && j.result !== "success") throw new Error(j["error-type"] || "Primary API error");
+    if (!j.rates || Object.keys(j.rates).length < 10) throw new Error("Primary API returned too few rates");
+    state.dataSource = "ExchangeRate-API Open Access";
+    return { rates: normalizeRatesFromBase(code, j.rates), date: extractLastUpdate(j), fallback: false };
+  } catch (primaryError) {
+    console.warn("Primary exchange-rate API failed:", primaryError);
   }
 
-  state.dataSource = liveSnapshot
-    ? `FxPulse curated · live-validated (${liveAdoptions} live, ${curatedOverrides} curated)`
-    : "FxPulse curated (offline)";
-  return { rates, date: today, fallback: !liveSnapshot };
+  // Fallback: Frankfurter. It is also a live frontend fetch, not a hardcoded
+  // table. If this fails too, callers show the explicit unavailable state.
+  try {
+    const r = await fetch(`${LIVE_API_FALLBACK}?base=${encodeURIComponent(code)}`, { cache: "no-store" });
+    if (!r.ok) throw new Error(`Fallback API HTTP ${r.status}`);
+    const j = await r.json();
+    const parsed = Array.isArray(j) ? ratesObjectFromFrankfurterRows(j) : { rates: j.rates, date: extractLastUpdate(j) };
+    if (!parsed.rates || Object.keys(parsed.rates).length < 5) throw new Error("Fallback API returned too few rates");
+    state.dataSource = "Frankfurter live fallback";
+    return { rates: normalizeRatesFromBase(code, parsed.rates), date: parsed.date || extractLastUpdate(j), fallback: false };
+  } catch (fallbackError) {
+    console.warn("Fallback exchange-rate API failed:", fallbackError);
+    throw new Error("Live rates are currently unavailable");
+  }
+}
+
+// Compatibility wrapper used by loadRates(). Historical synthetic fallbacks were
+// removed from the live conversion path so the UI never presents stale or
+// hardcoded rates as if they were current.
+async function fetchUSDRates(date = null, base = getBaseCode()) {
+  return fetchLiveRates(base);
 }
 
 // Date-seeded synthetic rates — used as a fallback when the live API can't
@@ -2666,23 +2679,19 @@ async function fetchHistorical(base, target, days, endDate = null) {
   const fmt = d => d.toISOString().slice(0,10);
   const anchorRate = rateBetween(base, target);
 
-  // PRIMARY PATH — when both currencies have curated values, generate the
-  // chart curve from synthSeries which is seeded on state.rates (so it ends
-  // EXACTLY at the live cross-rate). This guarantees the chart can never
-  // disagree with the hero converter, no matter what Frankfurter returns.
-  const haveCurated = FALLBACK_USD[base] != null && FALLBACK_USD[target] != null;
-  if (haveCurated && !endDate) {
-    return synthSeries(base, target, days, endDate);
-  }
+  if (!anchorRate || !isFinite(anchorRate)) return [];
 
-  // SECONDARY PATH — for currencies without curated values OR when an explicit
-  // historical date is requested, attempt Frankfurter and scale to anchor.
+  // Use Frankfurter for historical/trend series when available, then scale the
+  // last point to the currently loaded live cross-rate so charts agree with the
+  // converter.
   if (FRANK_OK.has(base) && FRANK_OK.has(target) && base !== target) {
     try {
-      const r = await fetch(`${FRANK}/${fmt(start)}..${fmt(end)}?from=${base}&to=${target}`);
+      const r = await fetch(`https://api.frankfurter.dev/v2/rates?from=${fmt(start)}&to=${fmt(end)}&base=${base}&quotes=${target}`);
       if (r.ok) {
         const j = await r.json();
-        let data = Object.keys(j.rates || {}).sort().map(d => ({ x: d, y: j.rates[d][target] }));
+        let data = Array.isArray(j)
+          ? j.filter(row => row.quote === target && Number.isFinite(Number(row.rate))).map(row => ({ x: row.date, y: Number(row.rate) })).sort((a,b) => a.x.localeCompare(b.x))
+          : Object.keys(j.rates || {}).sort().map(d => ({ x: d, y: j.rates[d][target] }));
         if (data.length > 0) {
           if (!endDate && anchorRate && isFinite(anchorRate)) {
             const last = data[data.length - 1].y;
@@ -2696,15 +2705,16 @@ async function fetchHistorical(base, target, days, endDate = null) {
       }
     } catch (e) { /* network/CORS — fall through */ }
   }
-  return synthSeries(base, target, days, endDate);
+  return [];
 }
 
 function mulberry32(a) {
   return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = a; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; };
 }
 function synthSeries(base, target, days, endDate = null) {
-  const baseUSD = state.rates[base] || FALLBACK_USD[base] || 1;
-  const tgtUSD = state.rates[target] || FALLBACK_USD[target] || 1;
+  const baseUSD = state.rates[base];
+  const tgtUSD = state.rates[target];
+  if (!baseUSD || !tgtUSD) return [];
   const target_ = tgtUSD / baseUSD;
   const seed = (base+target+(endDate||"")).split("").reduce((a,c)=>a+c.charCodeAt(0),0);
   const rnd = mulberry32(seed);
@@ -2735,11 +2745,17 @@ function rateBetween(from, to) {
   if (!f || !tg) return null;
   return tg / f;
 }
-function fmtNum(n) {
+function decimalsForCurrency(code, n) {
+  const c = (code || "").toUpperCase();
+  if (["CNY", "CNH", "JPY", "KRW", "VND", "IDR", "INR"].includes(c)) return 4;
+  if (["EUR", "GBP", "USD", "CAD", "AUD", "CHF"].includes(c)) return 2;
+  const a = Math.abs(Number(n) || 0);
+  return a >= 1000 ? 2 : a >= 1 ? 4 : 6;
+}
+function fmtNum(n, code = null) {
   if (n === null || n === undefined || isNaN(n)) return "—";
-  const a = Math.abs(n);
-  let dp = a >= 1000 ? 2 : a >= 100 ? 3 : a >= 1 ? 4 : 6;
-  return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: dp });
+  const dp = decimalsForCurrency(code, n);
+  return n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
 }
 // Light format for the hero/calculator input — no thousand separators, no padding zeros.
 // Lets users type digits and see exactly what they typed (calculator-style).
@@ -2791,16 +2807,26 @@ function renderHero() {
   document.getElementById("heroResultUnit").textContent = tgtCode;
 
   // Big result
+  const resultEl = document.getElementById("heroResultValue");
+  const rateLineEl = document.getElementById("heroRateLine");
+  resultEl.classList.toggle("rate-loading", !!state.isFetchingRates);
   const cross = tgtObj ? rateBetween(baseCode, tgtCode) : null;
-  const result = tgtObj ? state.amount * cross : null;
-  document.getElementById("heroResultValue").textContent = result !== null ? fmtNum(result) : "—";
-  document.getElementById("heroRateLine").textContent = tgtObj
-    ? `1 ${baseCode} = ${fmtNum(cross)} ${tgtCode}  ·  Mid-market`
-    : "Add a second currency to convert";
+  const result = (tgtObj && cross) ? state.amount * cross : null;
+  if (state.rateError) {
+    resultEl.classList.remove("rate-loading");
+    resultEl.textContent = "—";
+    rateLineEl.innerHTML = `<span class="rate-unavailable">Live rates are currently unavailable</span>`;
+  } else {
+    resultEl.textContent = result !== null ? fmtNum(result, tgtCode) : "—";
+    rateLineEl.textContent = tgtObj
+      ? `1 ${baseCode} = ${fmtNum(cross, tgtCode)} ${tgtCode}  ·  Mid-market`
+      : "Add a second currency to convert";
+  }
 
   // Tiers + insight card
   renderHeroTiers(baseCode, tgtCode, cross, result);
-  renderInsightCard();   // async — fetches history
+  if (!state.rateError) renderInsightCard();   // async — fetches history
+  else document.getElementById("heroInsight").innerHTML = `<div class="empty-hint">Live rates are currently unavailable</div>`;
 }
 
 /* ---------- THREE-TIER ACTUAL RECEIVED ----------
@@ -2822,24 +2848,24 @@ function renderHeroTiers(baseCode, tgtCode, cross, result) {
     <div class="tier mid">
       <span class="tier-best">${t("bestBadge")}</span>
       <div class="tier-label"><span class="tier-icon">🏦</span> ${t("midMarket")}</div>
-      <div class="tier-amount">${fmtNum(midAmt)} ${tgtCode}</div>
-      <div class="tier-rate">1 ${baseCode} = ${fmtNum(cross)} ${tgtCode} · ${t("interbank")}</div>
+      <div class="tier-amount">${fmtNum(midAmt, tgtCode)} ${tgtCode}</div>
+      <div class="tier-rate">1 ${baseCode} = ${fmtNum(cross, tgtCode)} ${tgtCode} · ${t("interbank")}</div>
     </div>
     <div class="tier wise">
       <div class="tier-label">
         <span class="tier-icon">💸</span> ${t("wiseLabel")}
         <span class="tier-spread neg">−${(WISE_SPREAD*100).toFixed(2)}%</span>
       </div>
-      <div class="tier-amount">${fmtNum(wiseAmt)} ${tgtCode}</div>
-      <div class="tier-rate">1 ${baseCode} ≈ ${fmtNum(cross*(1-WISE_SPREAD))} ${tgtCode} · ${t("wiseDesc")}</div>
+      <div class="tier-amount">${fmtNum(wiseAmt, tgtCode)} ${tgtCode}</div>
+      <div class="tier-rate">1 ${baseCode} ≈ ${fmtNum(cross*(1-WISE_SPREAD), tgtCode)} ${tgtCode} · ${t("wiseDesc")}</div>
     </div>
     <div class="tier bank">
       <div class="tier-label">
         <span class="tier-icon">🏛️</span> ${t("bankLabel")}
         <span class="tier-spread neg">−${(BANK_SPREAD*100).toFixed(2)}%</span>
       </div>
-      <div class="tier-amount">${fmtNum(bankAmt)} ${tgtCode}</div>
-      <div class="tier-rate">1 ${baseCode} ≈ ${fmtNum(cross*(1-BANK_SPREAD))} ${tgtCode} · ${t("bankDesc")}</div>
+      <div class="tier-amount">${fmtNum(bankAmt, tgtCode)} ${tgtCode}</div>
+      <div class="tier-rate">1 ${baseCode} ≈ ${fmtNum(cross*(1-BANK_SPREAD), tgtCode)} ${tgtCode} · ${t("bankDesc")}</div>
     </div>
   `;
 }
@@ -2979,15 +3005,9 @@ function renderAdScenarios() {
   }
   const baseCode = getBaseCode();
   const tgtCode = realCode(CUR_BY_KEY[tgtKey]);
-  // Robust cross-rate lookup with FALLBACK_USD as a last resort so the table
-  // never silently disappears when one rate is briefly missing.
-  let cross = rateBetween(baseCode, tgtCode);
-  if (!cross) {
-    const f = FALLBACK_USD[baseCode], tg = FALLBACK_USD[tgtCode];
-    if (f && tg) cross = tg / f;
-  }
+  const cross = rateBetween(baseCode, tgtCode);
   if (!cross || !isFinite(cross)) {
-    tableEl.innerHTML = `<div class="empty-hint">Rate unavailable for ${baseCode}/${tgtCode}. Try another pair.</div>`;
+    tableEl.innerHTML = `<div class="empty-hint">Live rates are currently unavailable</div>`;
     if (infoEl) infoEl.innerHTML = "";
     return;
   }
@@ -3058,14 +3078,15 @@ function setupAdScenarios() {
 }
 
 /* ---------- SWAP base ↔ target ---------- */
-function swapBaseTarget() {
+async function swapBaseTarget() {
   const baseKey = getBaseKey();
   const tgtKey = getHeroTargetKey();
   if (!tgtKey) return;
   // Move target to top, demote base
   state.rows = [tgtKey, ...state.rows.filter(k => k !== tgtKey)];
   state.chartTarget = baseKey;
-  renderAll();
+  await loadRates();
+  await renderAll();
 }
 
 /* ---------- IP geolocation — auto-detect user's local currency on first load ----------
@@ -3140,7 +3161,7 @@ function renderRows() {
       </div>
       <div class="cur-amount-cell">
         <input type="text" class="row-cur-input" data-key="${key}" value="${fmtNum(amount)}" />
-        <div class="cur-rate">1 ${baseCode} = ${fmtNum(cross)} ${tgtCode}</div>
+        <div class="cur-rate">1 ${baseCode} = ${fmtNum(cross, tgtCode)} ${tgtCode}</div>
       </div>
       ${trendHTML}
       ${state.rows.length > 1 ? `<button class="row-remove" data-action="remove" title="${t("remove")}">✕</button>` : '<div></div>'}
@@ -3189,9 +3210,9 @@ function updateAllAmounts() {
   if (tgtKey) {
     const tgtCode = realCode(CUR_BY_KEY[tgtKey]);
     const cross = rateBetween(baseCode, tgtCode);
-    const result = state.amount * cross;
+    const result = cross ? state.amount * cross : null;
     const rEl = document.getElementById("heroResultValue");
-    if (rEl) rEl.textContent = fmtNum(result);
+    if (rEl) rEl.textContent = result === null ? "—" : fmtNum(result, tgtCode);
     renderHeroTiers(baseCode, tgtCode, cross, result);
   }
   // Rows
@@ -3199,7 +3220,7 @@ function updateAllAmounts() {
     const k = li.dataset.key;
     const cur = CUR_BY_KEY[k];
     const cross = k === getBaseKey() ? 1 : rateBetween(baseCode, realCode(cur));
-    const amt = state.amount * (cross ?? 1);
+    const amt = cross ? state.amount * cross : null;
     const inp = li.querySelector(".row-cur-input");
     if (inp && document.activeElement !== inp) inp.value = fmtNum(amt);
   });
@@ -3209,21 +3230,22 @@ function updateAllAmounts() {
     if (!k) return;
     const cur = CUR_BY_KEY[k];
     const cross = k === getBaseKey() ? 1 : rateBetween(baseCode, realCode(cur));
-    const amt = state.amount * (cross ?? 1);
+    const amt = cross ? state.amount * cross : null;
     const ae = card.querySelector(".amount");
     if (ae) ae.textContent = fmtNum(amt);
   });
 }
 
 /* ---------- STATE MUTATIONS — all funnel through these ---------- */
-function setBase(key) {
+async function setBase(key) {
   if (!state.rows.includes(key) || state.rows[0] === key) return;
   state.rows = [key, ...state.rows.filter(k => k !== key)];
   // If chart target was the new base, pick another
   if (state.chartTarget === key) {
     state.chartTarget = state.rows.find(k => k !== key) || null;
   }
-  renderAll();
+  await loadRates();
+  await renderAll();
 }
 
 function addCurrency(key) {
@@ -3588,7 +3610,7 @@ function renderSnapshot() {
     const c = CUR_BY_KEY[k];
     const tgtCode = realCode(c);
     const cross = k === baseKey ? 1 : rateBetween(baseCode, tgtCode);
-    const amt = state.amount * (cross ?? 1);
+    const amt = cross ? state.amount * cross : null;
     let deltaHTML = "";
     if (k !== baseKey && cross && state.prevRates[baseCode] && state.prevRates[tgtCode]) {
       const prev = state.prevRates[tgtCode] / state.prevRates[baseCode];
@@ -3607,7 +3629,7 @@ function renderSnapshot() {
           </div>
         </div>
         <div class="amount">${fmtNum(amt)}</div>
-        <div class="rate">1 ${baseCode} = ${fmtNum(cross)} ${tgtCode}</div>
+        <div class="rate">1 ${baseCode} = ${fmtNum(cross, tgtCode)} ${tgtCode}</div>
         ${deltaHTML}
       </div>`;
   }).join("");
@@ -3698,9 +3720,7 @@ function renderNewsletter() {
   const baseCode = getBaseCode();
   const baseObj = CUR_BY_KEY[getBaseKey()];
   const usdRate = state.rates[baseCode] || 1;
-  const fb = FALLBACK_USD[baseCode] || usdRate;
-  const change = ((fb - usdRate)/fb) * 100;
-  const strength = change > 1.5 ? "strengthening" : change < -1.5 ? "weakening" : "broadly stable";
+  const strength = state.rateError ? "unavailable" : "broadly stable";
   el.innerHTML = `
     <div class="newsletter">
       <h3>📰 ${baseObj.country} ${baseCode} — Industry Brief</h3>
@@ -4061,30 +4081,40 @@ function toast(msg) {
    Fetches the latest rates AND a prior business-day comparison.
    Records timestamp + source for the user-visible trust signal. */
 async function loadRates() {
-  document.getElementById("loadingBar").style.width = "20%";
-  const today = state.date || new Date().toISOString().slice(0,10);
-  const prevDate = new Date(today);
-  prevDate.setDate(prevDate.getDate() - 5);
-  const [latest, prev] = await Promise.all([
-    fetchUSDRates(state.date),
-    fetchUSDRates(prevDate.toISOString().slice(0,10))
-  ]);
-  document.getElementById("loadingBar").style.width = "70%";
-  state.rates = { ...FALLBACK_USD, ...latest.rates };
-  let prevRates = { ...FALLBACK_USD, ...prev.rates };
-  const allEqual = Object.keys(state.rates).every(k => prevRates[k] === state.rates[k]);
-  if (latest.fallback || prev.fallback || allEqual) {
-    prevRates = synthesizePrevRates(state.rates);
-  }
-  state.prevRates = prevRates;
-  // Trust signals — state.dataSource is set inside fetchUSDRates by whichever
-  // provider succeeded, so we leave it alone here.
-  state.lastUpdate = latest.date;
-  state.fetchedAt = new Date();
-  state.isLive = !latest.fallback;
+  const bar = document.getElementById("loadingBar");
+  if (bar) bar.style.width = "20%";
+  state.isFetchingRates = true;
+  state.rateError = null;
   renderTrustSignal();
-  document.getElementById("loadingBar").style.width = "100%";
-  setTimeout(() => document.getElementById("loadingBar").style.width = "0", 400);
+  document.querySelectorAll("#heroResultValue, .row-cur-input, .cur-rate, #adTable .amount").forEach(el => el.classList.add("rate-loading"));
+
+  try {
+    const baseCode = getBaseCode();
+    const latest = await fetchUSDRates(state.date, baseCode);
+    if (bar) bar.style.width = "70%";
+    state.rates = { ...latest.rates };
+    state.prevRates = synthesizePrevRates(state.rates);
+    state.lastUpdate = latest.date;
+    state.fetchedAt = new Date();
+    state.isLive = true;
+    state.sourceBase = baseCode;
+  } catch (e) {
+    state.rates = {};
+    state.prevRates = {};
+    state.lastUpdate = null;
+    state.fetchedAt = new Date();
+    state.isLive = false;
+    state.rateError = "Live rates are currently unavailable";
+    state.dataSource = "No live source available";
+    toast("Live rates are currently unavailable");
+  } finally {
+    state.isFetchingRates = false;
+    renderTrustSignal();
+    if (bar) {
+      bar.style.width = "100%";
+      setTimeout(() => bar.style.width = "0", 400);
+    }
+  }
 }
 
 /* ---------- Format a YYYY-MM-DD into a localized human-readable date ---------- */
@@ -4122,11 +4152,13 @@ function renderTrustSignal() {
   let dot, label;
   if (inHistorical) { dot = "historical"; label = t("historicalMode"); }
   else if (state.isLive) { dot = "live"; label = t("liveRates"); }
-  else { dot = "stale"; label = t("offlineRates"); }
+  else { dot = "stale"; label = "Live rates are currently unavailable"; }
   const fetchedTxt = state.fetchedAt ? state.fetchedAt.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—";
   const metaHTML = inHistorical
     ? `<span class="trust-meta">· ${t("showRates")} <b>${state.lastUpdate || state.date}</b> · ${state.dataSource}</span>`
-    : `<span class="trust-meta">· ${t("lastUpdate")} <b>${state.lastUpdate || "—"}</b> · ${t("fetchedAt")} ${fetchedTxt} · ${state.dataSource}</span>`;
+    : state.rateError
+      ? `<span class="trust-meta">· ${state.rateError}</span>`
+      : `<span class="trust-meta">· ${t("lastUpdate")} <b>${state.lastUpdate || "—"}</b> · ${t("fetchedAt")} ${fetchedTxt} · ${state.dataSource} · base ${state.sourceBase}</span>`;
   el.innerHTML = `
     <span class="trust-dot ${dot}"></span>
     <span class="trust-text">
@@ -4189,6 +4221,14 @@ async function renderAll() {
   safeSync(renderNewsletter,  "renderNewsletter");
   safeSync(renderAdScenarios, "renderAdScenarios");
 
+  if (state.rateError) {
+    const d = document.getElementById("decisionContent");
+    if (d) d.innerHTML = `<div class="empty-hint">Live rates are currently unavailable</div>`;
+    const f = document.getElementById("forecastSummary");
+    if (f) f.innerHTML = `<div style="color:var(--text-dim);">Live rates are currently unavailable</div>`;
+    return;
+  }
+
   await safeAsync(renderChart, "renderChart");
 
   await safeAsync(renderDecision, "renderDecision", () => {
@@ -4222,8 +4262,9 @@ function initSortable() {
     delay: 80,                     // touch delay to avoid accidental drag while scrolling
     touchStartThreshold: 5,
     onStart: () => document.body.classList.add("dragging"),
-    onEnd: () => {
+    onEnd: async () => {
       document.body.classList.remove("dragging");
+      const oldBase = state.rows[0];
       const newVisible = Array.from(list.children).map(li => li.dataset.key);
       const hidden = state.rows.slice(state.displayCount);
       const newRows = [...newVisible, ...hidden];
@@ -4232,7 +4273,8 @@ function initSortable() {
         state.chartTarget = newRows.find(k => k !== newRows[0]) || null;
       }
       state.rows = newRows;
-      renderAll();
+      if (newRows[0] !== oldBase) await loadRates();
+      await renderAll();
     }
   });
 }
